@@ -1,0 +1,7 @@
+
+*.local
+Win32/Debug
+__history
+*.identcache
+*.res
+*.skincfg
