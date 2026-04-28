@@ -1,5 +1,7 @@
 # FDFastQuery
 
+**中文文档**: [README_CN](https://github.com/1847bell/FDFastQuery/blob/main/README_CN.md)
+
 FDFastQuery is a lightweight and efficient FireDAC query wrapper library for Delphi that provides a fluent, chainable API for database operations.
 
 ## Features
