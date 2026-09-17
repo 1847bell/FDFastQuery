@@ -82,21 +82,21 @@ type
 
   TDbConnResolver = class
   public
-    class function Resolve(const AConnKey: TFastQueryConnKey): TFDConnection; static;
+    // One lookup returns the registry entry, so callers read the name and the
+    // connection from the same item instead of querying the registry twice.
+    class function ResolveItem(const AConnKey: TFastQueryConnKey): TDbConnectionItem; static;
   end;
 
   TFastQuery = class(TInterfacedObject, IFastQuery)
   strict private
-    FConnKey: TFastQueryConnKey;
     FConnName: string;
     FQuery: TFDQuery;
     function AsInterface: IFastQuery;
-    function CountOpenedRows: Integer;
     function BuildParamsText: string;
     function BuildSqlText: string;
     function BuildTraceId: string;
     function GetElapsedMs(const AStartedAt: Cardinal): Int64;
-    procedure BindConnection;
+    procedure BindConnection(const AConnKey: TFastQueryConnKey);
     procedure ResetState;
     procedure ValidateSql;
   public
@@ -126,6 +126,22 @@ end;
 function ConnKeyAsText(const AConnKey: TFastQueryConnKey): string;
 begin
   Result := IntToStr(AConnKey);
+end;
+
+function NormalizeConnName(const AConnName, AKeyText: string): string;
+begin
+  Result := Trim(AConnName);
+  if Result = '' then
+    Result := AKeyText;
+end;
+
+function ConnectionDisplayName(const AItem: TDbConnectionItem;
+  const AConnKey: TFastQueryConnKey): string;
+begin
+  if AItem = nil then
+    Result := ConnKeyAsText(AConnKey)
+  else
+    Result := NormalizeConnName(AItem.ConnName, ConnKeyAsText(AConnKey));
 end;
 
 function GetConnectionItem(const AConnKey: TFastQueryConnKey): TDbConnectionItem;
@@ -237,13 +253,11 @@ begin
     GConnectionItems.AddObject(LKeyText, LItem);
   end;
 
-  if Trim(AConnName) = '' then
-    LItem.ConnName := LKeyText
-  else
-    LItem.ConnName := AConnName;
+  LItem.ConnName := NormalizeConnName(AConnName, LKeyText);
   LItem.Connection := AConnection;
 end;
 
+// Without a name, the connection is logged under the text form of its key (for example '0').
 procedure RegisterDbConnection(const AConnKey: TFastQueryConnKey;
   AConnection: TFDConnection);
 begin
@@ -278,14 +292,8 @@ begin
 end;
 
 function DbConnKeyToString(const AConnKey: TFastQueryConnKey): string;
-var
-  LItem: TDbConnectionItem;
 begin
-  LItem := GetConnectionItem(AConnKey);
-  if (LItem <> nil) and (Trim(LItem.ConnName) <> '') then
-    Result := LItem.ConnName
-  else
-    Result := ConnKeyAsText(AConnKey);
+  Result := ConnectionDisplayName(GetConnectionItem(AConnKey), AConnKey);
 end;
 
 procedure SetSqlLogger(const ALogger: ISqlLogger);
@@ -304,6 +312,40 @@ end;
 function NewFastQuery(const AConnKey: TFastQueryConnKey): IFastQuery;
 begin
   Result := TFastQuery.Create(AConnKey);
+end;
+
+procedure TryLogStart(const ATraceId, AConnName: string;
+  const AAction: TSqlAction; const ASQL, AParamsText: string);
+begin
+  try
+    GetSqlLogger.LogStart(ATraceId, AConnName, AAction, ASQL, AParamsText);
+  except
+    // Logging is best-effort and must not affect query execution.
+  end;
+end;
+
+procedure TryLogEnd(const ATraceId, AConnName: string;
+  const AAction: TSqlAction; const ASQL, AParamsText: string;
+  const ARows: Integer; const AElapsedMs: Int64);
+begin
+  try
+    GetSqlLogger.LogEnd(ATraceId, AConnName, AAction, ASQL, AParamsText,
+      ARows, AElapsedMs);
+  except
+    // Logging is best-effort and must not affect query execution.
+  end;
+end;
+
+procedure TryLogError(const ATraceId, AConnName: string;
+  const AAction: TSqlAction; const ASQL, AParamsText, AErrorText: string;
+  const AElapsedMs: Int64);
+begin
+  try
+    GetSqlLogger.LogError(ATraceId, AConnName, AAction, ASQL, AParamsText,
+      AErrorText, AElapsedMs);
+  except
+    // Preserve the original database exception.
+  end;
 end;
 
 { TFileSqlLogger }
@@ -376,19 +418,16 @@ end;
 
 { TDbConnResolver }
 
-class function TDbConnResolver.Resolve(const AConnKey: TFastQueryConnKey): TFDConnection;
-var
-  LItem: TDbConnectionItem;
+class function TDbConnResolver.ResolveItem(const AConnKey: TFastQueryConnKey): TDbConnectionItem;
 begin
-  LItem := GetConnectionItem(AConnKey);
-  if LItem = nil then
-    raise Exception.CreateFmt('Database connection not registered for key %s.',
-      [DbConnKeyToString(AConnKey)]);
-
-  Result := LItem.Connection;
+  Result := GetConnectionItem(AConnKey);
   if Result = nil then
+    raise Exception.CreateFmt('Database connection not registered for key %s.',
+      [ConnKeyAsText(AConnKey)]);
+
+  if Result.Connection = nil then
     raise Exception.CreateFmt('Database connection is nil for key %s.',
-      [DbConnKeyToString(AConnKey)]);
+      [ConnectionDisplayName(Result, AConnKey)]);
 end;
 
 { TFastQuery }
@@ -404,34 +443,13 @@ begin
   Result := Self;
 end;
 
-function TFastQuery.CountOpenedRows: Integer;
+procedure TFastQuery.BindConnection(const AConnKey: TFastQueryConnKey);
+var
+  LItem: TDbConnectionItem;
 begin
-  Result := 0;
-
-  if not FQuery.Active then
-    Exit;
-
-  if FQuery.IsEmpty then
-    Exit;
-
-  FQuery.DisableControls;
-  try
-    FQuery.First;
-    while not FQuery.Eof do
-    begin
-      Inc(Result);
-      FQuery.Next;
-    end;
-    FQuery.First;
-  finally
-    FQuery.EnableControls;
-  end;
-end;
-
-procedure TFastQuery.BindConnection;
-begin
-  FConnName := DbConnKeyToString(FConnKey);
-  FQuery.Connection := TDbConnResolver.Resolve(FConnKey);
+  LItem := TDbConnResolver.ResolveItem(AConnKey);
+  FConnName := ConnectionDisplayName(LItem, AConnKey);
+  FQuery.Connection := LItem.Connection;
 end;
 
 function TFastQuery.BuildParamsText: string;
@@ -479,10 +497,14 @@ end;
 constructor TFastQuery.Create(const AConnKey: TFastQueryConnKey);
 begin
   inherited Create;
-  FConnKey := AConnKey;
   FQuery := TFDQuery.Create(nil);
-  FQuery.FetchOptions.RecordCountMode := cmFetched;
-  BindConnection;
+  try
+    FQuery.FetchOptions.RecordCountMode := cmFetched;
+    BindConnection(AConnKey);
+  except
+    FQuery.Free;
+    raise;
+  end;
 end;
 
 function TFastQuery.DataSet: TFDQuery;
@@ -511,7 +533,7 @@ begin
   LTraceId := BuildTraceId;
   LSqlText := BuildSqlText;
   LParamsText := BuildParamsText;
-  GetSqlLogger.LogStart(LTraceId, FConnName, LAction, LSqlText, LParamsText);
+  TryLogStart(LTraceId, FConnName, LAction, LSqlText, LParamsText);
 
   LStartedAt := GetTickCount;
   try
@@ -520,14 +542,14 @@ begin
     FQuery.ExecSQL;
     LRows := FQuery.RowsAffected;
     LElapsedMs := GetElapsedMs(LStartedAt);
-    GetSqlLogger.LogEnd(LTraceId, FConnName, LAction, LSqlText, LParamsText,
+    TryLogEnd(LTraceId, FConnName, LAction, LSqlText, LParamsText,
       LRows, LElapsedMs);
     Result := LRows;
   except
     on E: Exception do
     begin
       LElapsedMs := GetElapsedMs(LStartedAt);
-      GetSqlLogger.LogError(LTraceId, FConnName, LAction, LSqlText,
+      TryLogError(LTraceId, FConnName, LAction, LSqlText,
         LParamsText, E.Message, LElapsedMs);
       raise;
     end;
@@ -554,24 +576,23 @@ begin
   LTraceId := BuildTraceId;
   LSqlText := BuildSqlText;
   LParamsText := BuildParamsText;
-  GetSqlLogger.LogStart(LTraceId, FConnName, LAction, LSqlText, LParamsText);
+  TryLogStart(LTraceId, FConnName, LAction, LSqlText, LParamsText);
 
   LStartedAt := GetTickCount;
   try
     if FQuery.Active then
       FQuery.Close;
     FQuery.Open;
-    FQuery.FetchAll;
-    LRows := CountOpenedRows;
+    LRows := FQuery.RecordCount;
     LElapsedMs := GetElapsedMs(LStartedAt);
-    GetSqlLogger.LogEnd(LTraceId, FConnName, LAction, LSqlText, LParamsText,
+    TryLogEnd(LTraceId, FConnName, LAction, LSqlText, LParamsText,
       LRows, LElapsedMs);
     Result := AsInterface;
   except
     on E: Exception do
     begin
       LElapsedMs := GetElapsedMs(LStartedAt);
-      GetSqlLogger.LogError(LTraceId, FConnName, LAction, LSqlText,
+      TryLogError(LTraceId, FConnName, LAction, LSqlText,
         LParamsText, E.Message, LElapsedMs);
       raise;
     end;
