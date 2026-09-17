@@ -9,7 +9,7 @@ FDFastQuery is a lightweight and efficient FireDAC query wrapper library for Del
 - **Fluent Chainable API**: Build queries with intuitive method chaining
 - **Type-Safe**: Compile-time safety with interface-based design
 - **Automatic SQL Logging**: Built-in SQL execution logging with trace IDs
-- **Performance Tracking**: Automatically records execution time and row counts
+- **Performance Tracking**: Records execution time, affected rows, and currently fetched rows
 - **Connection Management**: Centralized database connection registry
 - **Zero Configuration**: Ready to use with minimal setup
 
@@ -44,7 +44,11 @@ Project-specific bridge layer that wraps the core library:
 
 ## Quick Start
 
-### 1. Register Database Connection
+### 1. Register Database Connections
+
+Register each connection once, before the first query is created. The library never creates, opens
+or frees a connection: it only remembers the `TFDConnection` you hand it, and the component on your
+form or data module stays its owner.
 
 ```delphi
 uses
@@ -60,22 +64,45 @@ begin
 end;
 ```
 
+A few rules keep the setup predictable:
+
+- **Register before the first query.** `NewQuery` binds the connection right away, so creating a
+  query for an unregistered key raises `Database connection not registered for key N`. Registering
+  in `FormCreate` (or in a data module's `OnCreate`) covers the whole application.
+- **Registering the same key again overwrites the entry**, so a repeated call after a reconnect or
+  restart is harmless and never leaves a duplicate behind.
+- **The key identifies the connection; the name only shows up in the SQL log.** The bridge derives
+  the name from the enum, so `cnnMain` is logged as `[conMain]`. Registering through the core
+  overload that takes no name falls back to the key text, which is why a log can read `[0]`.
+- **Keep the enum order stable.** `TProjectDbConnKey` reaches the core as `Ord(AConnKey)`, so append
+  new keys at the end; inserting one in the middle silently rebinds the existing keys.
+- **Unregistering is optional.** `UnregisterDbConnection(key)` and `ClearDbConnections` drop the
+  registry entries only, so your `TFDConnection` components stay untouched.
+
 ### 2. Query with Parameters
 
 ```delphi
-// Simple query with parameters
-var
-  Q: IFastQuery;
+// Keep the query as a form field while its dataset is data-bound.
+type
+  TForm1 = class(TForm)
+  private
+    FQuery: IFastQuery;
+  end;
+
+procedure TForm1.LoadStudents;
 begin
-  Q := NewQuery(cnnMain);
-  Q.SQL('SELECT * FROM students WHERE student_no=:stn AND name=:name')
+  FQuery := NewQuery(cnnMain);
+  FQuery.SQL('SELECT * FROM students WHERE student_no=:stn AND name=:name')
    .Param('stn', '2023001')
-   .Param('name', '张三')
+   .Param('name', '张晨')
    .Open;
 
-  DataSource1.DataSet := Q.DataSet;
+  DataSource1.DataSet := FQuery.DataSet;
 end;
 ```
+
+Keep `FQuery` alive for as long as a control or `TDataSource` uses its dataset.
+The returned `TFDQuery` is owned by `IFastQuery` and is destroyed with it.
 
 ### 3. Execute Non-Query SQL
 
@@ -111,8 +138,8 @@ begin
 
   // Clear and reuse
   Q.Clear
-   .SQL('SELECT * FROM students WHERE class_id=:cid')
-   .Param('cid', 101)
+   .SQL('SELECT * FROM students WHERE class_name=:cname')
+   .Param('cname', '软件工程1班')
    .Open;
 end;
 ```
@@ -128,18 +155,19 @@ end;
 | `Param(const AName: string; const AValue: Variant)` | Set parameter value |
 | `Clear` | Clear SQL and parameters |
 | `Close` | Close query if open |
-| `Open` | Execute SELECT query and open dataset |
+| `Open` | Execute SELECT query and open the dataset without forcing all rows to be fetched |
 | `Exec: Integer` | Execute non-query SQL, returns rows affected |
-| `DataSet: TFDQuery` | Get underlying TFDQuery object |
+| `DataSet: TFDQuery` | Get the owned TFDQuery; keep the IFastQuery reference alive while using it |
 
 ### Connection Management
 
 | Function | Description |
 |----------|-------------|
-| `RegisterDbConnection(const AConnKey: TFastQueryConnKey; AConnection: TFDConnection)` | Register connection by key |
-| `UnregisterDbConnection(const AConnKey: TFastQueryConnKey)` | Unregister connection |
-| `ClearDbConnections` | Clear all registered connections |
-| `DbConnKeyToString(const AConnKey: TFastQueryConnKey)` | Get connection name |
+| `RegisterDbConnection(const AConnKey: TFastQueryConnKey; const AConnName: string; AConnection: TFDConnection)` | Register a connection under a key, with the name used in the SQL log |
+| `RegisterDbConnection(const AConnKey: TFastQueryConnKey; AConnection: TFDConnection)` | Same, with the name defaulting to the key text (`[0]` in the log) |
+| `UnregisterDbConnection(const AConnKey: TFastQueryConnKey)` | Drop one registry entry (the connection is not freed) |
+| `ClearDbConnections` | Drop every registry entry (connections are not freed) |
+| `DbConnKeyToString(const AConnKey: TFastQueryConnKey)` | Display name of a registered connection, or the key text if it is not registered |
 
 ### SQL Logging
 
@@ -154,11 +182,14 @@ The library includes automatic SQL logging that records:
 
 - SQL statement and parameters
 - Execution time in milliseconds
-- Number of rows affected
+- Number of rows affected by `Exec`, or rows currently fetched by `Open`
 - Trace ID for request correlation
 - Error messages if execution fails
 
 Log files are saved to: `logs\sql\{YYYYMMDD}.log`
+
+Logging is best-effort. Logger failures do not prevent SQL execution and do not
+replace the original database exception.
 
 Example log entry:
 ```
@@ -196,6 +227,24 @@ The included demo (`FastQuery.pas`) demonstrates:
 - Querying with parameters
 - Loading data into memory tables
 - Iterating through query results
+
+The form's three buttons map to those cases: **Grid1** runs a parameterized query into the first
+grid, **Grid2** round-trips rows through a `TFDMemTable` (it writes temporary `tmp` / `tmp.fds`
+files next to the executable), and **Memo** walks the `students` table row by row.
+
+The demo's connection parameters live in `FastQuery.dfm` and pin an absolute path,
+`D:\JQSoft\Code\FDFastQuery\student_demo.db`. Moving or renaming the repository breaks the demo
+until that path is updated in the IDE.
+
+## Troubleshooting
+
+- **`Database connection not registered for key 0`** — a query was created before
+  `RegisterProjectDbConnection` ran, or it used a different key than the registered one.
+- **Log lines show `[0]` instead of `[conMain]`** — the connection was registered through the core
+  overload without a name. Use `RegisterProjectDbConnection`, or the three-argument
+  `RegisterDbConnection`, when you want readable connection names in `logs\sql\*.log`.
+- **A grid goes blank right after loading** — the `IFastQuery` that owns the dataset was released,
+  for example because it was a local variable. Hold it in a field while the dataset is in use.
 
 ## Requirements
 
